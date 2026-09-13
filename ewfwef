@@ -1,4 +1,6 @@
 -- [[ Lua Hub — DOORS ULTIMATE SCRIPT v3.51 ]]
+-- v3.65 MOBILE UI/DRAWERS: Rayfield на ПК и touch, официальный source fallback;
+-- тройное открытие ящиков (executor API + InputHold + Virtual E) и ручная Rayfield-кнопка.
 -- v3.64 MOBILE DRAWERS: touch-safe fireproximityprompt + native InputHold fallback;
 -- ПК-путь не изменён, повторные мобильные удержания дедуплицируются по prompt.
 -- v3.63 SEEK RUN: временный WalkSpeed boost при реальном появлении Seek, без teleport.
@@ -66,7 +68,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local Lighting = game:GetService("Lighting")
-local HUB_VERSION = "3.64"
+local HUB_VERSION = "3.65"
 local originalFov = Camera and Camera.FieldOfView or 70
 
 -- Единый профиль производительности. На телефоне Roblox одновременно стримит
@@ -689,15 +691,13 @@ do
         end
     end)
 end
--- GUI: Rayfield — основной, встроенный M4 UI — страховка.
--- USE_RAYFIELD = false вернёт мгновенный встроенный UI без сети.
--- Rayfield красивее, но заметно тяжелее при touch-рендере и сам грузит дополнительные
--- сетевые модули. На телефоне используем локальный M4 UI, на ПК оставляем Rayfield.
-local USE_RAYFIELD = not IS_MOBILE
+-- Один и тот же Rayfield на ПК и телефоне. Встроенный M4 UI остаётся только аварийной
+-- страховкой, если executor полностью заблокировал HTTP/loadstring.
+local USE_RAYFIELD = true
 local Rayfield = nil
 local RAYFIELD_URLS = {
     'https://sirius.menu/rayfield',
-    'https://raw.githubusercontent.com/Sirius902/Rayfield/main/Rayfield.lua',
+    'https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua',
 }
 if USE_RAYFIELD then
     for _, u in ipairs(RAYFIELD_URLS) do
@@ -1605,6 +1605,7 @@ end)
 local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
     mobileDrawerPending = setmetatable({}, {__mode = "k"}),
+    virtualInputManager = nil,
     instantDurations = setmetatable({}, {__mode = "k"}),
     -- Промпт, который игра прямо сейчас показывает игроку (ведётся по
     -- PromptShown/PromptHidden). Нужен, чтобы клавиша E уходила именно в нашу цель,
@@ -1617,6 +1618,7 @@ local DoorAssist = {
     -- "авто-ящики не работают" нечем объяснить: все ветки молча возвращали false.
     lastFireReject = "",
 }
+pcall(function() DoorAssist.virtualInputManager = game:GetService("VirtualInputManager") end)
 function DoorAssist.normal(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
 end
@@ -1829,6 +1831,19 @@ function DoorAssist.nativeHoldPress(prompt, holdSeconds)
     return ok
 end
 
+function DoorAssist.virtualEPress(prompt)
+    -- Виртуальная E разрешена только для prompt, который Roblox реально показывает
+    -- игроку. Так кнопка не попадёт в соседнюю дверь, шкаф или кровать.
+    local vim = DoorAssist.virtualInputManager
+    if not vim or DoorAssist.shownPrompt ~= prompt then return false end
+    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+    return pcall(function()
+        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.06)
+        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+end
+
 -- Один быстрый путь вместо 4x fireproximityprompt + PromptPressed + InputHold.
 -- Старый вариант посылал до шести активаций на один ящик/дверь и делал task.wait
 -- прямо внутри сканирующего потока — это и давало основной фриз при стриминге комнаты.
@@ -1872,6 +1887,11 @@ local function FirePrompt(prompt, mode, radius)
                 if HubActive and prompt and prompt.Parent and prompt.Enabled
                     and not DoorAssist.protected(prompt, nil) then
                     DoorAssist.nativeHoldPress(prompt, hold)
+                    -- Последняя страховка для мобильных executors, которые не проводят
+                    -- ни fireproximityprompt, ни прямой InputHold до серверного prompt.
+                    if prompt and prompt.Parent and prompt.Enabled then
+                        DoorAssist.virtualEPress(prompt)
+                    end
                 end
                 DoorAssist.mobileDrawerPending[prompt] = nil
             end)
@@ -2222,7 +2242,7 @@ local function StartHub()
 
     local Window = Rayfield:CreateWindow({
         Name = "Lua Hub", Icon = 0, LoadingTitle = "Lua Hub", LoadingSubtitle = "DOORS — Hotel / Mines / The Outdoors",
-        ShowText = "Lua Hub", Theme = "Amethyst", Acrylic = true, Transparency = 0.12,
+        ShowText = "Lua Hub", Theme = "Amethyst", Acrylic = not IS_MOBILE, Transparency = 0.12,
         ConfigurationSaving = { Enabled = false, FolderName = "LuaHub_Config", FileName = "DoorsUltimate" },
         Discord = {Enabled = false, Invite = "noinvitelink", RememberJoins = false},
         KeySystem = false
@@ -2904,6 +2924,35 @@ local function StartHub()
     MainTab:CreateToggle({Name = "Auto Open Drawers/Containers", CurrentValue = true, Callback = function(v)
         autoOpenEnabled = v
         Rayfield:Notify({Title = "📦 Auto Drawers", Content = v and "Авто-открытие ящиков — ВКЛ" or "Авто-открытие ящиков — ВЫКЛ", Duration = 2})
+    end})
+    MainTab:CreateButton({Name = "📱 Open nearest drawer (mobile fallback)", Callback = function()
+        local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        local best, bestDist = nil, math.huge
+        local shown = DoorAssist.shownPrompt
+        if shown and shown.Parent and isContainerPrompt(shown) and not DoorAssist.protected(shown, nil) then
+            local pos = promptWorldPosition(shown)
+            local dist = pos and (pos - root.Position).Magnitude or math.huge
+            if dist <= autoOpenRadius then best, bestDist = shown, dist end
+        end
+        if not best then
+            for prompt in pairs(globalPrompts) do
+                if prompt.Parent and prompt.Enabled and isContainerPrompt(prompt)
+                    and not DoorAssist.protected(prompt, nil) then
+                    local pos = promptWorldPosition(prompt)
+                    local dist = pos and (pos - root.Position).Magnitude or math.huge
+                    if dist <= autoOpenRadius and dist < bestDist then
+                        best, bestDist = prompt, dist
+                    end
+                end
+            end
+        end
+        if best then
+            FirePrompt(best, "autoDrawer", autoOpenRadius)
+            Rayfield:Notify({Title = "📦 Drawer", Content = "Открываю ближайший ящик: " .. math.floor(bestDist) .. "m", Duration = 2})
+        else
+            Rayfield:Notify({Title = "📦 Drawer", Content = "Подойди ближе к ящику (радиус " .. autoOpenRadius .. "m)", Duration = 2})
+        end
     end})
     MainTab:CreateLabel("Auto Enter Lockers: отключено — шкафы и кровати только вручную")
 
