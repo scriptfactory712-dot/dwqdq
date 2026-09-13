@@ -1926,29 +1926,36 @@ local function FirePrompt(prompt, mode, radius)
         if ok and not touchDrawer then return true end
     end
     if touchDrawer then
-        -- Один fallback на prompt: сканер и PromptShown могут найти один ящик вместе.
-        -- Небольшая задержка даёт fireproximityprompt время отключить уже открытый
-        -- prompt; если он остался активен, имитируем настоящее удержание на телефоне.
+        -- На mobile executor-API часто возвращает true без реального PromptTriggered.
+        -- Поэтому после первого fire делаем короткий hammer-фолбек: InputHold -> Virtual E ->
+        -- вторая executor-сигнатура, пока серверный prompt не подтвердится или пока он не исчез.
         if not DoorAssist.mobileDrawerPending[prompt] then
             DoorAssist.mobileDrawerPending[prompt] = true
             local hold = tonumber(prompt.HoldDuration) or 0.12
-            task.delay(0.10, function()
-                if HubActive and prompt and prompt.Parent and prompt.Enabled
-                    and not DoorAssist.protected(prompt, nil) then
+            task.delay(0.08, function()
+                local function stillUsable()
+                    return HubActive and prompt and prompt.Parent and prompt.Enabled
+                        and not DoorAssist.protected(prompt, nil)
+                end
+                for _ = 1, 3 do
+                    if not stillUsable() then break end
                     local confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if not confirmed then DoorAssist.nativeHoldPress(prompt, hold) end
-                    -- Последняя страховка для мобильных executors, которые не проводят
-                    -- ни fireproximityprompt, ни прямой InputHold до серверного prompt.
+                    if confirmed then break end
+                    if not confirmed then
+                        DoorAssist.nativeHoldPress(prompt, hold)
+                    end
                     confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if not confirmed and prompt and prompt.Parent and prompt.Enabled then
+                    if confirmed then break end
+                    if not confirmed and stillUsable() then
                         DoorAssist.virtualEPress(prompt)
                     end
                     confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if not confirmed and type(fireproximityprompt) == "function"
-                        and prompt and prompt.Parent and prompt.Enabled then
+                    if confirmed then break end
+                    if not confirmed and type(fireproximityprompt) == "function" and stillUsable() then
                         -- Вторая распространённая сигнатура мобильных executors.
                         pcall(fireproximityprompt, prompt, 1)
                     end
+                    task.wait(0.16)
                 end
                 DoorAssist.mobileDrawerPending[prompt] = nil
             end)
