@@ -1,4 +1,6 @@
 -- [[ Lua Hub — DOORS ULTIMATE SCRIPT v3.51 ]]
+-- v3.68 MOBILE DRAWERS/TRACERS: единый touch-safe InputHold pipeline без VirtualInput,
+-- ограниченные повторы ящиков и GUI-tracers, работающие без Drawing API на телефоне.
 -- v3.67 FULL AUDIT: официальный Luau parse/O0/O2/analyze; исправлен touch pinch zoom,
 -- очищено ложное глобальное состояние и предупреждения неоднозначных statement-строк.
 -- v3.66 MOBILE CAMERA/PROMPTS: камера обновляется после respawn/смены CurrentCamera,
@@ -90,7 +92,7 @@ local PERF = {
     batchSlice = IS_MOBILE and 0.0025 or 0.0055,
     autoOpenTick = IS_MOBILE and 0.85 or 0.45,
     fireCooldown = IS_MOBILE and 1.20 or 0.80,
-    indexYieldEvery = IS_MOBILE and 250 or 700,
+    indexYieldEvery = IS_MOBILE and 120 or 700,
 }
 
 local originalLighting = {
@@ -685,7 +687,7 @@ do
         local hubs = {M4WarningGui = true, M4SeekHud = true, M4WarnPanel = true,
             M4SurgeAlert = true, M4ODThreat = true, M4StairwellThreat = true,
             M4BackdoorHud = true, M4HubUI = true, M4BootError = true, M4FlyMobile = true,
-            Rayfield = true}
+            M4TracerGui = true, Rayfield = true}
         local roots = {}
         pcall(function() roots[#roots + 1] = game:GetService("CoreGui") end)
         pcall(function()
@@ -1316,15 +1318,34 @@ local function getRoomPrompts(room)
     local c = promptCache[room]
     if not c then
         c = {}
+        -- Публикуем пустой кэш до первого yield: параллельный сканер не начнёт второй
+        -- полный обход той же комнаты во время стриминга за открывшейся дверью.
+        promptCache[room] = c
         pcall(function()
-            for _, v in ipairs(room:GetDescendants()) do
-                if v:IsA("ProximityPrompt") then table.insert(c, v) end
+            local indexed = setmetatable({}, {__mode = "k"})
+            local function addPrompt(v)
+                if v:IsA("ProximityPrompt") and not indexed[v] then
+                    indexed[v] = true
+                    table.insert(c, v)
+                end
             end
             local conn
             conn = room.DescendantAdded:Connect(function(v)
-                if v:IsA("ProximityPrompt") then table.insert(c, v) end
+                addPrompt(v)
             end)
             promptConns[room] = conn
+            -- Не создаём огромный массив GetDescendants в кадр открытия двери.
+            -- DFS обрабатывается маленькими порциями; PromptShown всё равно реагирует сразу.
+            local stack, processed = {room}, 0
+            while #stack > 0 and room.Parent do
+                local node = table.remove(stack)
+                for _, v in ipairs(node:GetChildren()) do
+                    addPrompt(v)
+                    stack[#stack + 1] = v
+                    processed = processed + 1
+                    if processed % (IS_MOBILE and 90 or 300) == 0 then task.wait() end
+                end
+            end
             -- FIX утечки: коннект держал комнату в памяти вечно.
             -- Комната ушла — отписываемся и чистим кэш.
             room.Destroying:Connect(function()
@@ -1334,7 +1355,6 @@ local function getRoomPrompts(room)
                 promptCache[room] = nil
             end)
         end)
-        promptCache[room] = c
     end
     return c
 end
@@ -1619,7 +1639,6 @@ local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
     drawerStates = setmetatable({}, {__mode = "k"}),
     drawerActive = 0,
-    drawerEpoch = 0,
     drawerStatus = "Подойди к ящику",
     instantDurations = setmetatable({}, {__mode = "k"}),
     -- Промпт, который игра прямо сейчас показывает игроку (ведётся по
@@ -1632,17 +1651,7 @@ local DoorAssist = {
     -- Последняя причина отказа FirePrompt/canFire (видно в probe). Без неё
     -- "авто-ящики не работают" нечем объяснить: все ветки молча возвращали false.
     lastFireReject = "",
-    -- FIX mobile drawers: эти таблицы должны существовать до первого FirePrompt.
-    -- Раньше FirePrompt/autoDrawer падал на DoorAssist.promptConfirmedAt[prompt],
-    -- а pcall вокруг тика авто-открытия молча съедал ошибку — на телефоне ящики
-    -- не открывались без единой записи.
-    promptConfirmedAt = setmetatable({}, {__mode = "k"}),
-    mobileDrawerPending = setmetatable({}, {__mode = "k"}),
-    virtualInputManager = nil,
 }
-pcall(function()
-    DoorAssist.virtualInputManager = game:GetService("VirtualInputManager")
-end)
 function DoorAssist.normal(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
 end
@@ -1867,28 +1876,11 @@ function DoorAssist.nativeHoldPress(prompt, holdSeconds)
     return ok
 end
 
-function DoorAssist.virtualEPress(prompt)
-    -- Виртуальная E разрешена только для prompt, который Roblox реально показывает
-    -- игроку. Так кнопка не попадёт в соседнюю дверь, шкаф или кровать.
-    local vim = DoorAssist.virtualInputManager
-    if not vim or DoorAssist.shownPrompt ~= prompt then return false end
-    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
-    return pcall(function()
-        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-        task.wait(0.06)
-        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-    end)
-end
-
--- Один быстрый путь вместо 4x fireproximityprompt + PromptPressed + InputHold.
--- Старый вариант посылал до шести активаций на один ящик/дверь и делал task.wait
--- прямо внутри сканирующего потока — это и давало основной фриз при стриминге комнаты.
+-- Единый путь активации. На touch сначала используется та же сигнатура executor API,
+-- которая работает на ПК, а затем официальный ProximityPrompt InputHold fallback.
+-- Все ожидания вынесены из сканирующего потока и ограничены двумя параллельными ящиками.
 local function FirePrompt(prompt, mode, radius)
     if not prompt or not prompt.Parent then return false end
-    if mode == "autoDrawer" and DoorAssist.promptConfirmedAt[prompt] then
-        DoorAssist.lastFireReject = "drawer-complete"
-        return false
-    end
     -- Последний централизованный предохранитель. Даже если любой классификатор
     -- ошибочно назовёт шкаф предметом/золотом/дверью, автоматического E не будет.
     if DoorAssist.protected(prompt, nil) then
@@ -1897,11 +1889,13 @@ local function FirePrompt(prompt, mode, radius)
     end
     local touchDrawer = mode == "autoDrawer" and UserInputService.TouchEnabled
     if touchDrawer then
-        -- Нативный touch prompt должен реально попасть в радиус активации. Иначе
-        -- InputHold/виртуальная E не увидят его, даже если наш сканер уже нашёл ящик.
+        -- Эти свойства реплицируются локально и нужны нативному touch prompt. Не трогаем
+        -- их до protected-проверки, чтобы шкафы/кровати никогда не стали активной целью.
         pcall(function()
+            prompt.Enabled = true
             prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, tonumber(radius) or 10)
             prompt.RequiresLineOfSight = false
+            prompt.ClickablePrompt = true
         end)
     end
     if not DoorAssist.canFire(prompt, mode, radius) then return false end
@@ -1910,57 +1904,69 @@ local function FirePrompt(prompt, mode, radius)
     if mode == "autoDrawer" then cooldown = IS_MOBILE and 0.55 or 0.35 end
     if mode == "autoDoor" then cooldown = IS_MOBILE and 0.70 or 0.45 end
     if mode == "autoPickup" then cooldown = IS_MOBILE and 0.75 or 0.50 end
-    if nowF - (DoorAssist.fired[prompt] or -10) < cooldown then return false end
-    DoorAssist.fired[prompt] = nowF
-    local attemptStarted = nowF
-    if type(fireproximityprompt) == "function" then
-        -- Некоторые мобильные executors молча игнорируют второй аргумент, но pcall
-        -- всё равно возвращает true. На touch вызываем совместимую одноаргументную
-        -- форму и ниже оставляем нативную страховку; ПК использует прежний быстрый путь.
-        local ok
-        if touchDrawer then
-            ok = pcall(fireproximityprompt, prompt)
-        else
-            ok = pcall(fireproximityprompt, prompt, 0)
-        end
-        if ok and not touchDrawer then return true end
+    if nowF - (DoorAssist.fired[prompt] or -10) < cooldown then
+        DoorAssist.lastFireReject = "cooldown"
+        return false
     end
     if touchDrawer then
-        -- На mobile executor-API часто возвращает true без реального PromptTriggered.
-        -- Поэтому после первого fire делаем короткий hammer-фолбек: InputHold -> Virtual E ->
-        -- вторая executor-сигнатура, пока серверный prompt не подтвердится или пока он не исчез.
-        if not DoorAssist.mobileDrawerPending[prompt] then
-            DoorAssist.mobileDrawerPending[prompt] = true
-            local hold = tonumber(prompt.HoldDuration) or 0.12
-            task.delay(0.08, function()
-                local function stillUsable()
+        local state = DoorAssist.drawerStates[prompt]
+        if not state then
+            state = {attempts = 0, last = -10, triggeredAt = -10, running = false}
+            DoorAssist.drawerStates[prompt] = state
+        end
+        if state.running or nowF - state.triggeredAt < 1.25 then
+            DoorAssist.lastFireReject = state.running and "drawer-running" or "drawer-triggered"
+            return false
+        end
+        if state.attempts >= 4 then
+            if nowF - state.last < 4 then
+                DoorAssist.lastFireReject = "drawer-retry-wait"
+                return false
+            end
+            state.attempts = 0
+        end
+        if DoorAssist.drawerActive >= 2 then
+            DoorAssist.lastFireReject = "drawer-budget"
+            return false
+        end
+        DoorAssist.fired[prompt] = nowF
+        state.running = true
+        state.attempts = state.attempts + 1
+        state.last = nowF
+        DoorAssist.drawerActive = DoorAssist.drawerActive + 1
+        DoorAssist.drawerStatus = "Открываю: " .. tostring(prompt.ObjectText ~= "" and prompt.ObjectText or prompt.Name)
+        task.defer(function()
+            pcall(function()
+                local attemptStarted = nowF
+                local function usable()
                     return HubActive and prompt and prompt.Parent and prompt.Enabled
                         and not DoorAssist.protected(prompt, nil)
                 end
-                for _ = 1, 3 do
-                    if not stillUsable() then break end
-                    local confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if confirmed then break end
-                    if not confirmed then
-                        DoorAssist.nativeHoldPress(prompt, hold)
-                    end
-                    confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if confirmed then break end
-                    if not confirmed and stillUsable() then
-                        DoorAssist.virtualEPress(prompt)
-                    end
-                    confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
-                    if confirmed then break end
-                    if not confirmed and type(fireproximityprompt) == "function" and stillUsable() then
-                        -- Вторая распространённая сигнатура мобильных executors.
-                        pcall(fireproximityprompt, prompt, 1)
-                    end
-                    task.wait(0.16)
+                if usable() and type(fireproximityprompt) == "function" then
+                    -- Нулевая длительность — рабочая desktop-сигнатура и наиболее широко
+                    -- совместимая форма у мобильных executors.
+                    pcall(fireproximityprompt, prompt, 0)
                 end
-                DoorAssist.mobileDrawerPending[prompt] = nil
+                task.wait(0.07)
+                if usable() and state.triggeredAt < attemptStarted then
+                    DoorAssist.nativeHoldPress(prompt, 0.09)
+                end
+                task.wait(0.06)
+                if usable() and state.triggeredAt < attemptStarted
+                    and type(fireproximityprompt) == "function" then
+                    -- Одноаргументная сигнатура — только последний fallback, не основной путь.
+                    pcall(fireproximityprompt, prompt)
+                end
             end)
-        end
+            state.running = false
+            DoorAssist.drawerActive = math.max(0, DoorAssist.drawerActive - 1)
+        end)
         return true
+    end
+    DoorAssist.fired[prompt] = nowF
+    if type(fireproximityprompt) == "function" then
+        local ok = pcall(fireproximityprompt, prompt, 0)
+        if ok then return true end
     end
     -- Executor без fireproximityprompt: нативный fallback не блокирует сканер.
     local hold = tonumber(prompt.HoldDuration) or 0.12
@@ -2264,16 +2270,49 @@ end
 -- ===== TRACERS (линии от низа экрана к целям) =====
 local tracersOn = false
 local tracerPool = {}
-local tracerSupported = (type(Drawing) == "table" and type(Drawing.new) == "function")
+local tracerGui = nil
+local tracerLastFrame = 0
+local tracerMaxLines = IS_MOBILE and 32 or 72
+local function ensureTracerGui()
+    if tracerGui and tracerGui.Parent then return tracerGui end
+    tracerGui = Instance.new("ScreenGui")
+    tracerGui.Name = "M4TracerGui"
+    tracerGui.IgnoreGuiInset = true
+    tracerGui.ResetOnSpawn = false
+    tracerGui.DisplayOrder = 999996
+    parentGui(tracerGui)
+    return tracerGui
+end
+local function tracerLine(index)
+    local line = tracerPool[index]
+    if line and line.Parent then return line end
+    line = Instance.new("Frame")
+    line.Name = "Line" .. tostring(index)
+    line.AnchorPoint = Vector2.new(0.5, 0.5)
+    line.BorderSizePixel = 0
+    line.BackgroundTransparency = 0.14
+    line.ZIndex = 1
+    line.Parent = ensureTracerGui()
+    tracerPool[index] = line
+    return line
+end
+local function positionTracer(line, from, target, color)
+    local delta = target - from
+    local length = delta.Magnitude
+    line.BackgroundColor3 = color
+    line.Position = UDim2.fromOffset((from.X + target.X) * 0.5, (from.Y + target.Y) * 0.5)
+    line.Size = UDim2.fromOffset(length, IS_MOBILE and 2.4 or 1.8)
+    line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+    line.Visible = length > 1
+end
 local function tracerClear()
     for _, l in ipairs(tracerPool) do
         pcall(function() l.Visible = false end)
     end
 end
 local function tracerDestroy()
-    for _, l in ipairs(tracerPool) do
-        pcall(function() l:Remove() end)
-    end
+    if tracerGui then pcall(function() tracerGui:Destroy() end) end
+    tracerGui = nil
     tracerPool = {}
 end
 
@@ -2284,7 +2323,8 @@ local FloorLabel = nil
 local timothyCleanCache = setmetatable({}, {__mode = "k"})
 local function containerHasTimothy(m)
     if not m then return false end
-    if timothyCleanCache[m] then return false end
+    local cached = timothyCleanCache[m]
+    if cached ~= nil then return cached end
     local found = false
     pcall(function()
         for _, d in ipairs(m:GetDescendants()) do
@@ -2295,9 +2335,9 @@ local function containerHasTimothy(m)
             end
         end
     end)
-    if not found then
-        timothyCleanCache[m] = true
-    end
+    -- Кэшируем оба исхода. Раньше модели с Timothy сканировались по всем descendants
+    -- на каждом тике, что особенно заметно тормозило слабые телефоны.
+    timothyCleanCache[m] = found
     return found
 end
 local autoOpenPatterns = {
@@ -2706,44 +2746,37 @@ local function StartHub()
         flyBV.Velocity = dir * flySpeed
     end)
 
-    -- TRACERS: рисуем линии к целям (нужен Drawing API в экзекьюторе)
-    if tracerSupported then
-        RunService:BindToRenderStep("M4_Tracers", Enum.RenderPriority.Camera.Value + 7, function()
-            if not tracersOn then
-                tracerClear()
-                return
-            end
-            local cam = workspace.CurrentCamera
-            if not cam then return end
-            local vp = cam.ViewportSize
-            local from = Vector2.new(vp.X / 2, vp.Y)
-            local idx = 0
-            for _, esp in ipairs(ActiveESPs) do
-                if esp.Part and esp.Part.Parent then
-                    local sp, onScreen = cam:WorldToViewportPoint(esp.Part.Position)
-                    if onScreen and sp.Z > 0 then
-                        idx = idx + 1
-                        local line = tracerPool[idx]
-                        if not line then
-                            line = Drawing.new("Line")
-                            line.Thickness = 1.4
-                            line.Transparency = 0.8
-                            tracerPool[idx] = line
-                        end
-                        pcall(function()
-                            line.Color = espSettings.colors[esp.Type] or Color3.fromRGB(0, 255, 140)
-                            line.From = from
-                            line.To = Vector2.new(sp.X, sp.Y)
-                            line.Visible = true
-                        end)
-                    end
+    -- GUI-tracers работают одинаково на ПК и touch и не зависят от Drawing API.
+    -- На телефоне обновляем максимум 30 раз/с и ограничиваем число линий.
+    RunService:BindToRenderStep("M4_Tracers", Enum.RenderPriority.Camera.Value + 7, function()
+        if not tracersOn then
+            tracerClear()
+            return
+        end
+        local now = os.clock()
+        if IS_MOBILE and now - tracerLastFrame < 1 / 30 then return end
+        tracerLastFrame = now
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local vp = cam.ViewportSize
+        local from = Vector2.new(vp.X * 0.5, math.max(0, vp.Y - 3))
+        local idx = 0
+        for _, esp in ipairs(ActiveESPs) do
+            if idx >= tracerMaxLines then break end
+            if esp.Part and esp.Part.Parent then
+                local sp, onScreen = cam:WorldToViewportPoint(esp.Part.Position)
+                if onScreen and sp.Z > 0 then
+                    idx = idx + 1
+                    local line = tracerLine(idx)
+                    pcall(positionTracer, line, from, Vector2.new(sp.X, sp.Y),
+                        espSettings.colors[esp.Type] or Color3.fromRGB(0, 255, 140))
                 end
             end
-            for i = idx + 1, #tracerPool do
-                pcall(function() tracerPool[i].Visible = false end)
-            end
-        end)
-    end
+        end
+        for i = idx + 1, #tracerPool do
+            pcall(function() tracerPool[i].Visible = false end)
+        end
+    end)
 
     if LPlayer then
     LPlayer.CharacterAdded:Connect(function(char)
@@ -2760,11 +2793,8 @@ local function StartHub()
 
     MainTab:CreateToggle({Name = "Custom FOV", CurrentValue = false, Callback = function(v) espSettings.fovEnabled = v end})
     MainTab:CreateToggle({Name = "Tracers (линии к целям)", CurrentValue = false, Callback = function(v)
-        if v and not tracerSupported then
-            Rayfield:Notify({Title = "Tracers", Content = "Экзекьютор не поддерживает Drawing API", Duration = 4})
-            return
-        end
         tracersOn = v
+        if v then ensureTracerGui() end
         if not v then tracerClear() end
     end})
     MainTab:CreateSlider({Name = "Field Of View", Range = {70, 120}, Increment = 1, CurrentValue = 70, Callback = function(v) espSettings.targetFov = v end})
@@ -2906,8 +2936,14 @@ local function StartHub()
         return found
     end
     task.spawn(function()
-        local n = indexPromptsIn(workspace)
-        print("[LuaHub/AutoDrawers] проиндексировано промптов:", n)
+        if IS_MOBILE then
+            -- На touch ближайшие комнаты кэшируются отдельно, а внешний prompt приходит
+            -- через PromptShown. Полный DFS workspace на старте только отнимает кадры.
+            print("[LuaHub/AutoDrawers] mobile event index active")
+        else
+            local n = indexPromptsIn(workspace)
+            print("[LuaHub/AutoDrawers] проиндексировано промптов:", n)
+        end
     end)
     workspace.DescendantAdded:Connect(function(d)
         if d:IsA("ProximityPrompt") then globalPrompts[d] = true end
@@ -3077,8 +3113,10 @@ local function StartHub()
             end
         end
         if best then
-            FirePrompt(best, "autoDrawer", autoOpenRadius)
-            Rayfield:Notify({Title = "📦 Drawer", Content = "Открываю ближайший ящик: " .. math.floor(bestDist) .. "m", Duration = 2})
+            local started = FirePrompt(best, "autoDrawer", autoOpenRadius)
+            local content = started and ("Открываю ближайший ящик: " .. math.floor(bestDist) .. "m")
+                or ("Повтор через секунду (" .. tostring(DoorAssist.lastFireReject) .. ")")
+            Rayfield:Notify({Title = "📦 Drawer", Content = content, Duration = 2})
         else
             Rayfield:Notify({Title = "📦 Drawer", Content = "Подойди ближе к ящику (радиус " .. autoOpenRadius .. "m)", Duration = 2})
         end
@@ -3209,18 +3247,23 @@ local function StartHub()
         end
     end)
 
-    -- Подтверждение реального взаимодействия. На мобильных pcall может вернуть true,
-    -- хотя executor ничего не отправил; PromptTriggered позволяет отличить это от успеха.
+    -- Подтверждение реального взаимодействия. Не помечаем prompt навсегда завершённым:
+    -- некоторые ящики используют один и тот же prompt повторно для нескольких секций.
     pcall(function()
         game:GetService("ProximityPromptService").PromptTriggered:Connect(function(prompt)
-            if HubActive and prompt then DoorAssist.promptConfirmedAt[prompt] = os.clock() end
+            if not HubActive or not prompt then return end
+            local state = DoorAssist.drawerStates[prompt]
+            if state then
+                state.triggeredAt = os.clock()
+                state.attempts = 0
+                DoorAssist.drawerStatus = "Открыто: " .. tostring(prompt.ObjectText ~= "" and prompt.ObjectText or prompt.Name)
+            end
         end)
     end)
 
-    -- PromptShown covers containers outside CurrentRooms and containers that were
-    -- already nearby when a new room was parented. The one-shot state prevents the
-    -- visibility event and the polling fallback from activating the same prompt twice.
-    game:GetService("ProximityPromptService").PromptShown:Connect(function(prompt)
+    -- PromptShown покрывает контейнеры вне CurrentRooms и даёт touch-пути точный prompt,
+    -- который Roblox уже показывает на экране. Cooldown/state дедуплицируют его с тиком.
+    game:GetService("ProximityPromptService").PromptShown:Connect(function(prompt, _inputType)
         if not HubActive then return end
         -- Запоминаем, какой промпт игра показывает игроку: по нему сверяется клавиша E.
         DoorAssist.shownPrompt = prompt
@@ -3252,6 +3295,14 @@ local function StartHub()
     game:GetService("ProximityPromptService").PromptHidden:Connect(function(prompt)
         if DoorAssist.shownPrompt == prompt then DoorAssist.shownPrompt = nil end
         DoorAssist.restoreInstant(prompt)
+        local state = DoorAssist.drawerStates[prompt]
+        if state then
+            task.delay(0.25, function()
+                if DoorAssist.shownPrompt ~= prompt and DoorAssist.drawerStates[prompt] == state then
+                    DoorAssist.drawerStates[prompt] = nil
+                end
+            end)
+        end
     end)
 
     local doorCloseQueue = {}
@@ -3317,21 +3368,22 @@ local function StartHub()
                             end
                         end
                     end
-                    -- Глобальный индекс: промпты, которых нет в комнатах (служебные папки,
-                    -- префабы, лобби, мебель с составными именами).
-                    for gp in pairs(globalPrompts) do
-                        if gp.Parent then
-                            -- Промпты уже просмотренных комнат есть и в globalPrompts.
-                            -- Не классифицируем и не активируем их второй раз в тот же тик.
-                            local ownerRoom = DoorAssist.roomOf(gp)
-                            if not ownerRoom or not seenRoom[ownerRoom] then
-                                local promptPos = promptWorldPosition(gp)
-                                if promptPos and (promptPos - root.Position).Magnitude <= autoOpenRadius then
-                                    handlePrompt(gp, promptPos)
+                    -- На touch PromptShown покрывает внешние prompts событийно; повторный
+                    -- глобальный обход всей карты лишь создавал микрофризы. На ПК сохраняем
+                    -- расширенный поиск служебных объектов вне CurrentRooms.
+                    if not IS_MOBILE then
+                        for gp in pairs(globalPrompts) do
+                            if gp.Parent then
+                                local ownerRoom = DoorAssist.roomOf(gp)
+                                if not ownerRoom or not seenRoom[ownerRoom] then
+                                    local promptPos = promptWorldPosition(gp)
+                                    if promptPos and (promptPos - root.Position).Magnitude <= autoOpenRadius then
+                                        handlePrompt(gp, promptPos)
+                                    end
                                 end
+                            else
+                                globalPrompts[gp] = nil
                             end
-                        else
-                            globalPrompts[gp] = nil
                         end
                     end
                 end
