@@ -73,7 +73,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local Lighting = game:GetService("Lighting")
-local HUB_VERSION = "3.67"
+local HUB_VERSION = "3.68"
 local originalFov = Camera and Camera.FieldOfView or 70
 local originalCameraSettings = {
     mode = LPlayer and LPlayer.CameraMode or nil,
@@ -1617,9 +1617,10 @@ end)
 -- A single owner for navigation, prompt safety and reversible instant-hold changes.
 local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
-    mobileDrawerPending = setmetatable({}, {__mode = "k"}),
-    promptConfirmedAt = setmetatable({}, {__mode = "k"}),
-    virtualInputManager = nil,
+    drawerStates = setmetatable({}, {__mode = "k"}),
+    drawerActive = 0,
+    drawerEpoch = 0,
+    drawerStatus = "Подойди к ящику",
     instantDurations = setmetatable({}, {__mode = "k"}),
     -- Промпт, который игра прямо сейчас показывает игроку (ведётся по
     -- PromptShown/PromptHidden). Нужен, чтобы клавиша E уходила именно в нашу цель,
@@ -1632,7 +1633,6 @@ local DoorAssist = {
     -- "авто-ящики не работают" нечем объяснить: все ветки молча возвращали false.
     lastFireReject = "",
 }
-pcall(function() DoorAssist.virtualInputManager = game:GetService("VirtualInputManager") end)
 function DoorAssist.normal(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
 end
