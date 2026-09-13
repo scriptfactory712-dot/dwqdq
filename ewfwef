@@ -1,4 +1,6 @@
 -- [[ Lua Hub — DOORS ULTIMATE SCRIPT v3.51 ]]
+-- v3.69 THREAT AUTO-HIDE: безопасный вход в ближайшее укрытие только при Rush/Ambush,
+-- Blitz, A-60/A-120 или Surge; единый PC/touch trigger и ограниченный радиус без teleport.
 -- v3.68 MOBILE DRAWERS/TRACERS: единый touch-safe InputHold pipeline без VirtualInput,
 -- ограниченные повторы ящиков и GUI-tracers, работающие без Drawing API на телефоне.
 -- v3.67 FULL AUDIT: официальный Luau parse/O0/O2/analyze; исправлен touch pinch zoom,
@@ -75,7 +77,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local Lighting = game:GetService("Lighting")
-local HUB_VERSION = "3.68"
+local HUB_VERSION = "3.69"
 local originalFov = Camera and Camera.FieldOfView or 70
 local originalCameraSettings = {
     mode = LPlayer and LPlayer.CameraMode or nil,
@@ -1638,6 +1640,7 @@ end)
 local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
     drawerStates = setmetatable({}, {__mode = "k"}),
+    promptTriggeredAt = setmetatable({}, {__mode = "k"}),
     drawerActive = 0,
     drawerStatus = "Подойди к ящику",
     instantDurations = setmetatable({}, {__mode = "k"}),
@@ -1711,9 +1714,9 @@ function DoorAssist.protected(prompt, mode)
         current = current.Parent
     end
     if action:find("hide", 1, true) or action:find("enterhiding", 1, true) then hiding = true end
-    -- Автоматическим путям нельзя входить в hiding spot ни при каком mode.
-    -- Ручное игровое E не использует FirePrompt и продолжает работать.
-    if hiding then return true end
+    -- Единственное исключение — отдельный threatHide mode. Он вызывается только
+    -- белым списком rushing-сущностей и только когда игрок уже стоит рядом с укрытием.
+    if hiding and mode ~= "threatHide" then return true end
     return false
 end
 -- Проверка "луч не перекрыт" для RequiresLineOfSight. Отдельная функция без замыканий:
@@ -1779,6 +1782,7 @@ function DoorAssist.canFire(prompt, mode, radius)
         or mode == "manualE" or mode == "instantE"
         or mode == "autoLocker" or mode == "autoDrawer" or mode == "autoDrawerNative"
         or mode == "autoDrawerHold" or mode == "hardOpen"
+        or mode == "threatHide"
     if prompt.RequiresLineOfSight and not losExempt then
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Exclude
@@ -1883,7 +1887,7 @@ local function FirePrompt(prompt, mode, radius)
     if not prompt or not prompt.Parent then return false end
     -- Последний централизованный предохранитель. Даже если любой классификатор
     -- ошибочно назовёт шкаф предметом/золотом/дверью, автоматического E не будет.
-    if DoorAssist.protected(prompt, nil) then
+    if DoorAssist.protected(prompt, mode) then
         DoorAssist.lastFireReject = "hiding-blocked"
         return false
     end
@@ -1904,6 +1908,7 @@ local function FirePrompt(prompt, mode, radius)
     if mode == "autoDrawer" then cooldown = IS_MOBILE and 0.55 or 0.35 end
     if mode == "autoDoor" then cooldown = IS_MOBILE and 0.70 or 0.45 end
     if mode == "autoPickup" then cooldown = IS_MOBILE and 0.75 or 0.50 end
+    if mode == "threatHide" then cooldown = IS_MOBILE and 0.70 or 0.55 end
     if nowF - (DoorAssist.fired[prompt] or -10) < cooldown then
         DoorAssist.lastFireReject = "cooldown"
         return false
@@ -1964,6 +1969,21 @@ local function FirePrompt(prompt, mode, radius)
         return true
     end
     DoorAssist.fired[prompt] = nowF
+    if mode == "threatHide" and UserInputService.TouchEnabled then
+        local attemptStarted = nowF
+        if type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, prompt, 0)
+        end
+        -- Некоторые mobile executors подтверждают вызов, но не передают его игре.
+        -- Нативный hold идёт только если PromptTriggered не пришёл после первой попытки.
+        task.delay(0.07, function()
+            if HubActive and prompt and prompt.Parent and prompt.Enabled
+                and (DoorAssist.promptTriggeredAt[prompt] or -10) < attemptStarted then
+                DoorAssist.nativeHoldPress(prompt, 0.09)
+            end
+        end)
+        return true
+    end
     if type(fireproximityprompt) == "function" then
         local ok = pcall(fireproximityprompt, prompt, 0)
         if ok then return true end
@@ -2048,8 +2068,9 @@ local autoOpenEnabled = true
 local autoDoorsEnabled = true
 local autoOpenRadius = 10
 local autoCloseDoors = false
-local autoHideEnabled = false
-local AUTO_HIDE_ALLOWED = false
+local autoHideEnabled = true
+local AUTO_HIDE_ALLOWED = true
+local autoHideRadius = 9
 local autoPickupEnabled = true
 local bdRuntime = {enabled = {}, autoHide = false, fullbright = false}
 local antiRuntime = {enabled = {drone = false, screech = false, timothy = false}}
@@ -2486,7 +2507,15 @@ local function StartHub()
     MainTab:CreateToggle({Name = "Slide Speed Boost", CurrentValue = false, Callback = function(v) slideBoostEnabled = v end})
     MainTab:CreateSlider({Name = "Slide Speed (max 20)", Range = {15, 20}, Increment = 1, CurrentValue = 20, Callback = function(v) slideSpeed = math.clamp(v, 15, 20) end})
     MainTab:CreateToggle({Name = "Lock WalkSpeed (anti-reset)", CurrentValue = true, Callback = function(v) speedBox.lock = v end})
-    MainTab:CreateLabel("Auto-Hide отключён: наведение на шкаф/кровать не прячет игрока")
+    MainTab:CreateToggle({Name = "Threat Auto-Hide (Rush/Blitz/A-60/Surge)", CurrentValue = true, Callback = function(v)
+        autoHideEnabled = v
+        Rayfield:Notify({Title = "🛡️ Threat Auto-Hide", Content = v
+            and "Вход только при настоящей rushing-угрозе рядом" or "Авто-вход выключен", Duration = 3})
+    end})
+    MainTab:CreateSlider({Name = "Auto-Hide Reach", Range = {4, 12}, Increment = 1, Suffix = "m", CurrentValue = 9, Callback = function(v)
+        autoHideRadius = math.clamp(v, 4, 12)
+    end})
+    MainTab:CreateLabel("Простое наведение безопасно: без угрозы шкаф/кровать не активируются")
     MainTab:CreateToggle({Name = "Auto-Objectives (floor-aware)", CurrentValue = false, Callback = function(v) autoObjectives = v end})
     MainTab:CreateToggle({Name = "Auto-Close Doors", CurrentValue = false, Callback = function(v) autoCloseDoors = v end})
     MainTab:CreateToggle({Name = "Instant E — без зажимания (без кресел/укрытий)", CurrentValue = true, Callback = function(v)
@@ -2975,6 +3004,7 @@ local function StartHub()
                 or (n == "locker" and not itemLocker) or n:find("lockerlarge", 1, true)
                 or n:find("roomslocker", 1, true) or n:find("circularvent", 1, true)
                 or n:find("gardencabinet", 1, true) or n:find("outhouse", 1, true)
+                or n:find("dumpster", 1, true) or n == "fridge" or n:find("sewagegrate", 1, true)
                 or n == "bed" or n:find("backdoorwardrobe", 1, true) then
                 return true
             end
@@ -3252,6 +3282,7 @@ local function StartHub()
     pcall(function()
         game:GetService("ProximityPromptService").PromptTriggered:Connect(function(prompt)
             if not HubActive or not prompt then return end
+            DoorAssist.promptTriggeredAt[prompt] = os.clock()
             local state = DoorAssist.drawerStates[prompt]
             if state then
                 state.triggeredAt = os.clock()
@@ -3486,58 +3517,142 @@ local function StartHub()
     end)
 
     local lastHideFire = 0
-    local function tryAutoHide()
-        -- Полный запрет автоматического входа в шкафы/кровати по запросу пользователя.
-        if not AUTO_HIDE_ALLOWED then return end
-        if not autoHideEnabled and not (bdRuntime.autoHide and getFloor() == 0) then return end
-        if os.clock() - lastHideFire < 3 then return end
+    local threatNotified = setmetatable({}, {__mode = "k"})
+    local function characterIsHidden()
+        local char = LPlayer.Character
+        if not char then return false end
+        local hidden = false
+        pcall(function()
+            hidden = char:GetAttribute("Hiding") == true or char:GetAttribute("Hidden") == true
+                or LPlayer:GetAttribute("Hiding") == true or LPlayer:GetAttribute("Hidden") == true
+        end)
+        return hidden
+    end
+    local function hidingPromptAvailable(prompt)
+        if not prompt or not prompt.Parent or not prompt.Enabled or not isHidingPrompt(prompt) then return false end
+        local cur = prompt.Parent
+        for _ = 1, 8 do
+            if not cur then break end
+            local occupied = false
+            pcall(function()
+                occupied = cur:GetAttribute("Occupied") == true or cur:GetAttribute("InUse") == true
+                local hp = cur:FindFirstChild("HiddenPlayer") or cur:FindFirstChild("Occupant")
+                if hp and hp:IsA("ObjectValue") and hp.Value and hp.Value ~= LPlayer then occupied = true end
+            end)
+            if occupied then return false end
+            cur = cur.Parent
+        end
+        return true
+    end
+    local function tryAutoHide(threatLabel)
+        if not AUTO_HIDE_ALLOWED or not autoHideEnabled or characterIsHidden() then return false end
+        if os.clock() - lastHideFire < 0.65 then return false end
         local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if not root then return end
+        if not root then return false end
         local bestPrompt, bestD = nil, math.huge
-        for _, room in ipairs(getNearbyRooms()) do
-            for _, v in ipairs(getRoomPrompts(room)) do
-                if v.Parent then
-                    local mn = v.Parent.Name
-                    for _, h in ipairs(HSListGlobal) do
-                        if mn == h then
-                            local promptPos = promptWorldPosition(v)
-                            local d = promptPos and (promptPos - root.Position).Magnitude or math.huge
-                            if d < bestD then bestD, bestPrompt = d, v end
-                            break
-                        end
-                    end
-                end
+        local function consider(prompt)
+            if not hidingPromptAvailable(prompt) then return end
+            local pos = promptWorldPosition(prompt)
+            local dist = pos and (pos - root.Position).Magnitude or math.huge
+            local nativeReach = tonumber(prompt.MaxActivationDistance) or autoHideRadius
+            if dist <= autoHideRadius and dist <= nativeReach + 1 and dist < bestD then
+                bestPrompt, bestD = prompt, dist
             end
         end
-        if bestPrompt and bestD <= 60 then
-            if not FirePrompt(bestPrompt, "autoHide") then return end
-            lastHideFire = os.clock()
-            Rayfield:Notify({Title = "🚪 Auto-Hide", Content = "Прячемся! шкаф " .. math.floor(bestD) .. "m", Duration = 2})
+        -- Видимый prompt — самый точный и быстрый путь на телефоне.
+        consider(DoorAssist.shownPrompt)
+        if not bestPrompt then
+            local rooms, seenRoom = {}, {}
+            local function addRoom(room)
+                if room and not seenRoom[room] then seenRoom[room] = true; rooms[#rooms + 1] = room end
+            end
+            addRoom(DoorAssist.currentRoom())
+            for _, room in ipairs(getNearbyRooms()) do addRoom(room) end
+            for _, room in ipairs(rooms) do
+                for _, prompt in ipairs(getRoomPrompts(room)) do consider(prompt) end
+            end
+        end
+        if not bestPrompt then return false end
+        if not FirePrompt(bestPrompt, "threatHide", autoHideRadius) then return false end
+        lastHideFire = os.clock()
+        Rayfield:Notify({Title = "🛡️ AUTO-HIDE: " .. tostring(threatLabel or "DANGER"),
+            Content = "Вхожу в укрытие — " .. math.floor(bestD) .. "m", Duration = 2})
+        return true
+    end
+
+    -- Только сущности, от которых действительно спасает hiding spot. Остальные
+    -- (Seek/Haste/Lookman/A-90/Grumble и т.д.) сюда намеренно не попадают.
+    local function hidingThreat(model, floor)
+        local n = DoorAssist.normal(model and model.Name)
+        if n:find("backdoorrush", 1, true) or n:match("^blitz") then return "BLITZ", 300 end
+        if n:match("^ambush") or n:find("ambushmoving", 1, true) then return "AMBUSH", 320 end
+        if n:match("^rush") or n:find("rushmoving", 1, true) or n:find("rushentity", 1, true) then return "RUSH", 280 end
+        if n:match("^a60%d*$") or n:find("a60moving", 1, true) or n:match("^bash%d*$") then return "A-60 / BASH", 360 end
+        if n:match("^a120%d*$") or n:find("a120moving", 1, true) or n:find("scribbl", 1, true) then return "A-120 / SCRIBBLES", 280 end
+        if floor == 3 and (n:match("^surge") or n:find("surgeentity", 1, true)) then return "SURGE", 240 end
+        return nil, nil
+    end
+
+    -- Событийный реестр вместо обхода всех комнат 4–6 раз в секунду.
+    local hidingThreatModels = setmetatable({}, {__mode = "k"})
+    local function rememberHidingThreat(model)
+        if not HubActive or not model or not model:IsA("Model") then return end
+        local n = DoorAssist.normal(model.Name)
+        if n:find("backdoorrush", 1, true) or n:match("^blitz")
+            or n:match("^ambush") or n:find("ambushmoving", 1, true)
+            or n:match("^rush") or n:find("rushmoving", 1, true) or n:find("rushentity", 1, true)
+            or n:find("a60", 1, true) or n:find("bash", 1, true)
+            or n:find("a120", 1, true) or n:find("scribbl", 1, true)
+            or n:match("^surge") or n:find("surgeentity", 1, true) then
+            hidingThreatModels[model] = true
         end
     end
+    forEachEntityModel(rememberHidingThreat)
+    workspace.DescendantAdded:Connect(function(instance)
+        if HubActive and instance:IsA("Model") then rememberHidingThreat(instance) end
+    end)
 
     task.spawn(function()
         while HubActive do
-            task.wait(0.3)
-            if not autoHideEnabled and not (bdRuntime.autoHide and getFloor() == 0) then continue end
+            task.wait(IS_MOBILE and 0.24 or 0.16)
+            if not autoHideEnabled then continue end
             pcall(function()
                 local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
-                if not root then return end
-                local dangerFound = false
-                forEachEntityModel(function(m)
-                    if dangerFound then return end
-                    local ln = string.lower(m.Name)
-                    -- Шкаф действительно помогает против этих проходящих сущностей.
-                    -- Grumble/Giggle намеренно исключены: попытка спрятаться от них была ложной логикой.
-                    local shouldHide = ln:find("rush") or ln:find("ambush") or ln:find("blitz") or ln:find("backdoorrush")
-                    if shouldHide then
-                        local bp = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-                        if bp and (bp.Position - root.Position).Magnitude < 120 then
-                            dangerFound = true
-                            tryAutoHide()
+                if not root or characterIsHidden() then return end
+                local floor = getFloor()
+                local nearestModel, nearestLabel, nearestD, triggerD = nil, nil, math.huge, nil
+                for model in pairs(hidingThreatModels) do
+                    if not model.Parent then
+                        hidingThreatModels[model] = nil
+                    else
+                        local label, threshold = hidingThreat(model, floor)
+                        local bp = label and (model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)) or nil
+                        if bp then
+                            local dist = (bp.Position - root.Position).Magnitude
+                            if dist < nearestD then
+                                nearestModel, nearestLabel, nearestD, triggerD = model, label, dist, threshold
+                            end
                         end
                     end
-                end)
+                end
+                -- Сообщение и попытка входа происходят в один danger-момент.
+                -- Так система не сажает игрока в Hotel-шкаф слишком рано до прихода Hide.
+                if not nearestModel or nearestD > triggerD then return end
+                if not threatNotified[nearestModel] then
+                    threatNotified[nearestModel] = true
+                    Rayfield:Notify({Title = "🚨 " .. nearestLabel .. " ЛЕТИТ!",
+                        Content = "Встань рядом с укрытием — Auto-Hide включён (" .. math.floor(nearestD) .. "m)", Duration = 4})
+                    if monsterWarnActive then
+                        WarningLabel.Text = "🚨 " .. nearestLabel .. " — СПРЯЧЬСЯ! 🚨"
+                        WarningLabel.Visible = true
+                        task.delay(4, function() if WarningLabel then WarningLabel.Visible = false end end)
+                    end
+                end
+                if counterHints then
+                    local h = nearestHiding()
+                    if h then ManageESP(h.Model, h.Part, "HIDE HERE", "hideHint") end
+                end
+                tryAutoHide(nearestLabel)
             end)
         end
     end)
@@ -3729,7 +3844,8 @@ local function StartHub()
                     local h = nearestHiding()
                     if h then ManageESP(h.Model, h.Part, "HIDE HERE", "hideHint") end
                 end
-                tryAutoHide()
+                -- Вход делает общий distance-aware детектор: здесь сущность может
+                -- только появиться в workspace, но ещё находиться слишком далеко.
             end
             if monsterWarnActive then
                 WarningLabel.Visible = true
@@ -4530,7 +4646,7 @@ local function StartHub()
     BackdoorTab:CreateSlider({Name = "Backdoor Auto Radius", Range = {3, 25}, Increment = 1, Suffix = "m", CurrentValue = 10, Callback = function(v) bdAutoRadius = math.clamp(v, 3, 25) end})
     BackdoorTab:CreateToggle({Name = "Auto Timer Lever", CurrentValue = false, Callback = function(v) bdEnabled.autoLever = v end})
     BackdoorTab:CreateToggle({Name = "Safe Auto Open Main Door (never Vacuum)", CurrentValue = false, Callback = function(v) bdEnabled.autoDoor = v end})
-    BackdoorTab:CreateLabel("Auto-Hide Blitz отключён: hiding spots используются только вручную")
+    BackdoorTab:CreateLabel("Threat Auto-Hide: Blitz поддерживается общей системой Main")
     BackdoorTab:CreateToggle({Name = "Fullbright for dark rooms", CurrentValue = false, Callback = function(v)
         bdRuntime.fullbright = v
         if not v and not fbEnabled and not (autoFullbrightMines and getFloor() == 2) then restoreLighting(); lightingOverridden = false end
