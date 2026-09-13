@@ -1632,7 +1632,17 @@ local DoorAssist = {
     -- Последняя причина отказа FirePrompt/canFire (видно в probe). Без неё
     -- "авто-ящики не работают" нечем объяснить: все ветки молча возвращали false.
     lastFireReject = "",
+    -- FIX mobile drawers: эти таблицы должны существовать до первого FirePrompt.
+    -- Раньше FirePrompt/autoDrawer падал на DoorAssist.promptConfirmedAt[prompt],
+    -- а pcall вокруг тика авто-открытия молча съедал ошибку — на телефоне ящики
+    -- не открывались без единой записи.
+    promptConfirmedAt = setmetatable({}, {__mode = "k"}),
+    mobileDrawerPending = setmetatable({}, {__mode = "k"}),
+    virtualInputManager = nil,
 }
+pcall(function()
+    DoorAssist.virtualInputManager = game:GetService("VirtualInputManager")
+end)
 function DoorAssist.normal(value)
     return string.lower(tostring(value or "")):gsub("[^%w]", "")
 end
