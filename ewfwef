@@ -1,4 +1,9 @@
 -- [[ Lua Hub — DOORS ULTIMATE SCRIPT v3.51 ]]
+-- v3.67 FULL AUDIT: официальный Luau parse/O0/O2/analyze; исправлен touch pinch zoom,
+-- очищено ложное глобальное состояние и предупреждения неоднозначных statement-строк.
+-- v3.66 MOBILE CAMERA/PROMPTS: камера обновляется после respawn/смены CurrentCamera,
+-- touch zoom/third-person восстанавливает Classic camera; ящики ждут PromptTriggered
+-- и повторяют разные способы активации только при отсутствии подтверждения.
 -- v3.65 MOBILE UI/DRAWERS: Rayfield на ПК и touch, официальный source fallback;
 -- тройное открытие ящиков (executor API + InputHold + Virtual E) и ручная Rayfield-кнопка.
 -- v3.64 MOBILE DRAWERS: touch-safe fireproximityprompt + native InputHold fallback;
@@ -68,8 +73,13 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local Lighting = game:GetService("Lighting")
-local HUB_VERSION = "3.65"
+local HUB_VERSION = "3.67"
 local originalFov = Camera and Camera.FieldOfView or 70
+local originalCameraSettings = {
+    mode = LPlayer and LPlayer.CameraMode or nil,
+    minZoom = LPlayer and LPlayer.CameraMinZoomDistance or 0.5,
+    maxZoom = LPlayer and LPlayer.CameraMaxZoomDistance or 12,
+}
 
 -- Единый профиль производительности. На телефоне Roblox одновременно стримит
 -- комнату, строит UI и обрабатывает touch, поэтому ему нужен меньший бюджет кадра.
@@ -865,7 +875,10 @@ local function parentGui(g)
         end
     end)
     if not placed then
-        pcall(function() g.Parent = game:GetService("CoreGui") placed = true end)
+        pcall(function()
+            g.Parent = game:GetService("CoreGui")
+            placed = true
+        end)
     end
     if (not placed) or (not g.Parent) then
         pcall(function()
@@ -1605,6 +1618,7 @@ end)
 local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
     mobileDrawerPending = setmetatable({}, {__mode = "k"}),
+    promptConfirmedAt = setmetatable({}, {__mode = "k"}),
     virtualInputManager = nil,
     instantDurations = setmetatable({}, {__mode = "k"}),
     -- Промпт, который игра прямо сейчас показывает игроку (ведётся по
@@ -1697,12 +1711,24 @@ function DoorAssist.canFire(prompt, mode, radius)
         DoorAssist.lastFireReject = "noprompt"
         return false
     end
-    if not prompt.Enabled then DoorAssist.lastFireReject = "disabled" return false end
-    if DoorAssist.protected(prompt, mode) then DoorAssist.lastFireReject = "protected" return false end
+    if not prompt.Enabled then
+        DoorAssist.lastFireReject = "disabled"
+        return false
+    end
+    if DoorAssist.protected(prompt, mode) then
+        DoorAssist.lastFireReject = "protected"
+        return false
+    end
     local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
     local pos = promptWorldPosition(prompt)
-    if not root then DoorAssist.lastFireReject = "noroot" return false end
-    if not pos then DoorAssist.lastFireReject = "nopos" return false end
+    if not root then
+        DoorAssist.lastFireReject = "noroot"
+        return false
+    end
+    if not pos then
+        DoorAssist.lastFireReject = "nopos"
+        return false
+    end
     -- globalOpen — открытие по всей карте: дистанцию ограничивает только явный лимит.
     -- autoDrawer работает через fireproximityprompt, где MaxActivationDistance промпта
     -- не проверяется, поэтому там тоже действует радиус хаба. Раньше
@@ -1849,11 +1875,24 @@ end
 -- прямо внутри сканирующего потока — это и давало основной фриз при стриминге комнаты.
 local function FirePrompt(prompt, mode, radius)
     if not prompt or not prompt.Parent then return false end
+    if mode == "autoDrawer" and DoorAssist.promptConfirmedAt[prompt] then
+        DoorAssist.lastFireReject = "drawer-complete"
+        return false
+    end
     -- Последний централизованный предохранитель. Даже если любой классификатор
     -- ошибочно назовёт шкаф предметом/золотом/дверью, автоматического E не будет.
     if DoorAssist.protected(prompt, nil) then
         DoorAssist.lastFireReject = "hiding-blocked"
         return false
+    end
+    local touchDrawer = mode == "autoDrawer" and UserInputService.TouchEnabled
+    if touchDrawer then
+        -- Нативный touch prompt должен реально попасть в радиус активации. Иначе
+        -- InputHold/виртуальная E не увидят его, даже если наш сканер уже нашёл ящик.
+        pcall(function()
+            prompt.MaxActivationDistance = math.max(prompt.MaxActivationDistance, tonumber(radius) or 10)
+            prompt.RequiresLineOfSight = false
+        end)
     end
     if not DoorAssist.canFire(prompt, mode, radius) then return false end
     local nowF = os.clock()
@@ -1863,7 +1902,7 @@ local function FirePrompt(prompt, mode, radius)
     if mode == "autoPickup" then cooldown = IS_MOBILE and 0.75 or 0.50 end
     if nowF - (DoorAssist.fired[prompt] or -10) < cooldown then return false end
     DoorAssist.fired[prompt] = nowF
-    local touchDrawer = mode == "autoDrawer" and UserInputService.TouchEnabled
+    local attemptStarted = nowF
     if type(fireproximityprompt) == "function" then
         -- Некоторые мобильные executors молча игнорируют второй аргумент, но pcall
         -- всё равно возвращает true. На touch вызываем совместимую одноаргументную
@@ -1886,11 +1925,19 @@ local function FirePrompt(prompt, mode, radius)
             task.delay(0.10, function()
                 if HubActive and prompt and prompt.Parent and prompt.Enabled
                     and not DoorAssist.protected(prompt, nil) then
-                    DoorAssist.nativeHoldPress(prompt, hold)
+                    local confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
+                    if not confirmed then DoorAssist.nativeHoldPress(prompt, hold) end
                     -- Последняя страховка для мобильных executors, которые не проводят
                     -- ни fireproximityprompt, ни прямой InputHold до серверного prompt.
-                    if prompt and prompt.Parent and prompt.Enabled then
+                    confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
+                    if not confirmed and prompt and prompt.Parent and prompt.Enabled then
                         DoorAssist.virtualEPress(prompt)
+                    end
+                    confirmed = (DoorAssist.promptConfirmedAt[prompt] or 0) >= attemptStarted
+                    if not confirmed and type(fireproximityprompt) == "function"
+                        and prompt and prompt.Parent and prompt.Enabled then
+                        -- Вторая распространённая сигнатура мобильных executors.
+                        pcall(fireproximityprompt, prompt, 1)
                     end
                 end
                 DoorAssist.mobileDrawerPending[prompt] = nil
@@ -1954,11 +2001,27 @@ local slideBoostEnabled = false
 -- FIX сброса скорости: лок включён по дефолту (как в доноре) — иначе игра
 -- сбрасывает WalkSpeed при смене комнаты/приседании, и "поставил 21" не держится.
 local thirdPerson = false
+local function setThirdPersonEnabled(enabled)
+    thirdPerson = enabled and true or false
+    pcall(function()
+        if thirdPerson then
+            -- На touch это возвращает pinch-zoom и разрешает отдалиться от персонажа.
+            LPlayer.CameraMode = Enum.CameraMode.Classic
+            LPlayer.CameraMinZoomDistance = 0.5
+            LPlayer.CameraMaxZoomDistance = 20
+        else
+            if originalCameraSettings.mode then LPlayer.CameraMode = originalCameraSettings.mode end
+            LPlayer.CameraMinZoomDistance = originalCameraSettings.minZoom
+            LPlayer.CameraMaxZoomDistance = originalCameraSettings.maxZoom
+            local hum = LPlayer.Character and LPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then hum.CameraOffset = Vector3.new(0, 0, 0) end
+        end
+    end)
+end
 local noclipEnabled = false
 local crouchHeld = false
 local autoOpenEnabled = true
 -- Автоматический вход в hiding spots полностью отключён: шкафы/кровати вручную.
-local lastThreatAt = 0
 local autoDoorsEnabled = true
 local autoOpenRadius = 10
 local autoCloseDoors = false
@@ -2093,9 +2156,17 @@ local function fpsSweepFX()
                 stack[#stack + 1] = d
                 pcall(function()
                     if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") or d:IsA("Beam") then
-                        if d.Enabled then fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "e"} d.Enabled = false n = n + 1 end
+                        if d.Enabled then
+                            fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "e"}
+                            d.Enabled = false
+                            n = n + 1
+                        end
                     elseif d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight") then
-                        if d.Shadows then fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "s"} d.Shadows = false n = n + 1 end
+                        if d.Shadows then
+                            fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "s"}
+                            d.Shadows = false
+                            n = n + 1
+                        end
                     end
                 end)
                 processed = processed + 1
@@ -2115,7 +2186,10 @@ local function fpsRestoreFX()
         end)
     end
     fpsFX.stored = {}
-    if fpsFX.conn then pcall(function() fpsFX.conn:Disconnect() end) fpsFX.conn = nil end
+    if fpsFX.conn then
+        pcall(function() fpsFX.conn:Disconnect() end)
+        fpsFX.conn = nil
+    end
 end
 local function applyFpsBoost(on, silent)
     fpsBoost = on
@@ -2138,9 +2212,15 @@ local function applyFpsBoost(on, silent)
                 if not HubActive or not fpsBoost then return end
                 pcall(function()
                     if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Smoke") or d:IsA("Fire") or d:IsA("Sparkles") or d:IsA("Beam") then
-                        if d.Enabled then fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "e"} d.Enabled = false end
+                        if d.Enabled then
+                            fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "e"}
+                            d.Enabled = false
+                        end
                     elseif d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight") then
-                        if d.Shadows then fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "s"} d.Shadows = false end
+                        if d.Shadows then
+                            fpsFX.stored[#fpsFX.stored + 1] = {i = d, k = "s"}
+                            d.Shadows = false
+                        end
                     end
                 end)
             end)
@@ -2336,7 +2416,9 @@ local function StartHub()
         charMods.canSlide = v
         if LPlayer.Character then LPlayer.Character:SetAttribute("CanSlide", v) end
     end})
-    MainTab:CreateToggle({Name = "Third Person", CurrentValue = false, Callback = function(v) thirdPerson = v end})
+    MainTab:CreateToggle({Name = "Third Person / Mobile Zoom", CurrentValue = false, Callback = function(v)
+        setThirdPersonEnabled(v)
+    end})
     MainTab:CreateToggle({Name = "Fly (полёт: WASD + Space/Shift, клавиша F)", CurrentValue = false, Callback = function(v)
         flyEnabled = v
         if not v then stopFly() end
@@ -2425,7 +2507,7 @@ local function StartHub()
         elseif input.KeyCode == Enum.KeyCode.T then
             teleportToDoor()
         elseif input.KeyCode == Enum.KeyCode.P then
-            thirdPerson = not thirdPerson
+            setThirdPersonEnabled(not thirdPerson)
             pcall(function()
                 Rayfield:Notify({Title = "Third Person", Content = thirdPerson and "3-е лицо — ВКЛ" or "3-е лицо — ВЫКЛ", Duration = 2})
             end)
@@ -2546,8 +2628,26 @@ local function StartHub()
         local char = LPlayer.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
         if not root then return end
+        local currentCamera = workspace.CurrentCamera
+        if not currentCamera then return end
+        Camera = currentCamera
+        pcall(function()
+            LPlayer.CameraMode = Enum.CameraMode.Classic
+            if LPlayer.CameraMaxZoomDistance < 20 then LPlayer.CameraMaxZoomDistance = 20 end
+        end)
+        if UserInputService.TouchEnabled then
+            -- На телефоне не перетираем CFrame: стандартная Classic-камера должна
+            -- получать pinch-жест и сама выбирать дистанцию.
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.CameraOffset.Magnitude > 0 then
+                hum.CameraOffset = Vector3.new(0, 0, 0)
+            end
+            return
+        end
         local camPos = root.CFrame * CFrame.new(0, 2.5, 7.5)
-        Camera.CFrame = CFrame.new(camPos.Position, root.Position + Vector3.new(0, 2, 0))
+        if currentCamera.CameraType ~= Enum.CameraType.Scriptable then
+            currentCamera.CFrame = CFrame.new(camPos.Position, root.Position + Vector3.new(0, 2, 0))
+        end
     end)
 
     -- ПОЛЁТ: один режим для ПК и телефона.
@@ -2651,8 +2751,13 @@ local function StartHub()
         if not v then tracerClear() end
     end})
     MainTab:CreateSlider({Name = "Field Of View", Range = {70, 120}, Increment = 1, CurrentValue = 70, Callback = function(v) espSettings.targetFov = v end})
-    RunService:BindToRenderStep("M4_FOV", Enum.RenderPriority.Camera.Value + 1, function()
-        if espSettings.fovEnabled then Camera.FieldOfView = espSettings.targetFov end
+    RunService:BindToRenderStep("M4_FOV", Enum.RenderPriority.Camera.Value + 10, function()
+        local currentCamera = workspace.CurrentCamera
+        if currentCamera then Camera = currentCamera end
+        if espSettings.fovEnabled and currentCamera
+            and currentCamera.FieldOfView ~= espSettings.targetFov then
+            currentCamera.FieldOfView = espSettings.targetFov
+        end
     end)
     MainTab:CreateToggle({Name = "Coin Pickup on [E]", CurrentValue = false, Callback = function(v) coinPickupOnE = v end})
 
@@ -2704,7 +2809,10 @@ local function StartHub()
     end
     local function setAutoCoin(value)
         autoCoinEnabled = value
-        if not value then disconnectAutoCoin() return end
+        if not value then
+            disconnectAutoCoin()
+            return
+        end
         if autoCoinStarted then return end
         autoCoinStarted = true
         local rooms = workspace:FindFirstChild("CurrentRooms")
@@ -2731,7 +2839,10 @@ local function StartHub()
                     local budget = IS_MOBILE and 5 or 9
                     for pile in pairs(goldPiles) do
                         if budget <= 0 then break end
-                        if not pile.Parent then goldPiles[pile] = nil continue end
+                        if not pile.Parent then
+                            goldPiles[pile] = nil
+                            continue
+                        end
                         local prompt = pile:FindFirstChild("LootPrompt")
                             or pile:FindFirstChildWhichIsA("ProximityPrompt", true)
                         if prompt and prompt.Parent and not prompt:GetAttribute("Interactions") then
@@ -2755,7 +2866,6 @@ local function StartHub()
     -- (мебель в служебных папках, префабы, лобби). Раньше скан шёл только по комнатам,
     -- поэтому объекты вроде «Office Desk with a Dresser» могли не находиться вообще.
     local globalPrompts = setmetatable({}, {__mode = "k"})
-    local globalIndexReady = false
     local function indexPromptsIn(root)
         local found = 0
         if not root then return found end
@@ -2780,7 +2890,6 @@ local function StartHub()
     end
     task.spawn(function()
         local n = indexPromptsIn(workspace)
-        globalIndexReady = true
         print("[LuaHub/AutoDrawers] проиндексировано промптов:", n)
     end)
     workspace.DescendantAdded:Connect(function(d)
@@ -2903,7 +3012,10 @@ local function StartHub()
         local cur = prompt.Parent
         for _ = 1, 7 do
             if not cur then break end
-            if cur:IsA("Tool") then hit = true break end
+            if cur:IsA("Tool") then
+                hit = true
+                break
+            end
             local n = DoorAssist.normal(cur.Name)
             local baseName = n:gsub("%d+$", "")
             if DoorAssist.pickupNames[n] or DoorAssist.pickupNames[baseName]
@@ -3078,6 +3190,14 @@ local function StartHub()
                 end
             end)
         end
+    end)
+
+    -- Подтверждение реального взаимодействия. На мобильных pcall может вернуть true,
+    -- хотя executor ничего не отправил; PromptTriggered позволяет отличить это от успеха.
+    pcall(function()
+        game:GetService("ProximityPromptService").PromptTriggered:Connect(function(prompt)
+            if HubActive and prompt then DoorAssist.promptConfirmedAt[prompt] = os.clock() end
+        end)
     end)
 
     -- PromptShown covers containers outside CurrentRooms and containers that were
@@ -3345,7 +3465,6 @@ local function StartHub()
                         local bp = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
                         if bp and (bp.Position - root.Position).Magnitude < 120 then
                             dangerFound = true
-                            lastThreatAt = os.clock()
                             tryAutoHide()
                         end
                     end
@@ -3537,14 +3656,11 @@ local function StartHub()
             if floor == 1 and (name:find("rush") or name:find("ambush")) then shouldHide = true end
             if floor == 0 and (name:find("backdoorrush") or name:find("blitz")) then shouldHide = true end
             if shouldHide then
-                lastThreatAt = os.clock()
                 if counterHints then
                     local h = nearestHiding()
                     if h then ManageESP(h.Model, h.Part, "HIDE HERE", "hideHint") end
                 end
                 tryAutoHide()
-            elseif name:find("seek") then
-                lastThreatAt = os.clock()
             end
             if monsterWarnActive then
                 WarningLabel.Visible = true
@@ -4383,7 +4499,10 @@ local function StartHub()
                 local bdAny = bdRuntime.autoHide or bdRuntime.fullbright
                 if not bdAny then
                     for _, on in pairs(bdEnabled) do
-                        if on then bdAny = true break end
+                        if on then
+                            bdAny = true
+                            break
+                        end
                     end
                 end
                 if not bdAny then return end
@@ -4895,7 +5014,10 @@ local function StartHub()
         odAnyOn = odSweepOn or odSurgeAlertOn or odThreatOn
         if not odAnyOn then
             for _, on in pairs(odEnabled) do
-                if on then odAnyOn = true break end
+                if on then
+                    odAnyOn = true
+                    break
+                end
             end
         end
     end
@@ -4945,7 +5067,10 @@ local function StartHub()
     OutdoorsTab:CreateSlider({Name = "Next Door reveal radius", Range = {20, 65}, Increment = 5, Suffix = "m", CurrentValue = 60, Callback = function(v) odRadius = v end})
     OutdoorsTab:CreateDivider()
     OutdoorsTab:CreateSection("Системы")
-    OutdoorsTab:CreateToggle({Name = "🌐 Глобальный поиск (вся карта)", CurrentValue = false, Callback = function(v) odSweepOn = v odRefreshAny() end})
+    OutdoorsTab:CreateToggle({Name = "🌐 Глобальный поиск (вся карта)", CurrentValue = false, Callback = function(v)
+        odSweepOn = v
+        odRefreshAny()
+    end})
     OutdoorsTab:CreateToggle({Name = "⚠ Surge Spawn Alert (баннер + радар)", CurrentValue = false, Callback = function(v)
         odSurgeAlertOn = v
         odRefreshAny()
@@ -6598,7 +6723,6 @@ local function StartHub()
                             droneLastPos[v] = p.Position
                             if moving then
                                 stampedeUntil = os.clock() + 8
-                                lastThreatAt = os.clock()
                                 if os.clock() - lastStampedeNotify >= 20 then
                                     lastStampedeNotify = os.clock()
                                     pcall(function()
@@ -6735,7 +6859,7 @@ local function StartHub()
         chestForce = false
         openAllOn = false
         counterHints = false
-        thirdPerson = false
+        setThirdPersonEnabled(false)
         noclipEnabled = false
         crouchHeld = false
         slideBoostEnabled = false
@@ -6831,7 +6955,6 @@ local function StartHub()
         espSettings.distance = false
         -- Сбрасываем одноразовые состояния, чтобы повторное включение работало как в первый раз.
         chestState = {}
-        roomScanned = {}
         globalScanned = {}
         pcall(function()
             for _, control in pairs(prefToggles) do
@@ -6894,7 +7017,10 @@ local function StartHub()
             sharedEnv.M4_HUB_STOP = nil
         end
         disconnectAutoCoin()
-        if speedConn then pcall(function() speedConn:Disconnect() end) speedConn = nil end
+        if speedConn then
+            pcall(function() speedConn:Disconnect() end)
+            speedConn = nil
+        end
         speedHum = nil
         ClearESPType("all")
         -- FIX: Unbind несуществующего степа кидает ошибку и обрывал остаток закрытия.
